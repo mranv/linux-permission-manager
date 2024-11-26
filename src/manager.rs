@@ -1,7 +1,7 @@
 use std::process::Command;
 use std::fs;
-use chrono::{DateTime, Utc, Duration};
-use tracing::{info, warn, error};
+use chrono::{Utc, Duration};
+use tracing::info;
 
 use crate::config::Config;
 use crate::db::{Database, PermissionGrant};
@@ -129,66 +129,64 @@ impl PermissionManager {
     }
 
     /// Update the sudoers file with current permissions
-    async fn update_sudoers_file(&self) -> Result<()> {
-        let header = "# This file is managed by permctl. Do not edit manually.\n\n";
-        let mut content = String::from(header);
+async fn update_sudoers_file(&self) -> Result<()> {
+    let header = "# This file is managed by permctl. Do not edit manually.\n\n";
+    let mut content = String::from(header);
 
-        // Get all active permissions from database
-        let all_permissions = sqlx::query_as!(
-            PermissionGrant,
-            r#"
-            SELECT *
-            FROM permission_grants
-            WHERE NOT revoked
-                AND expires_at > ?
-            ORDER BY username, command
-            "#,
-            Utc::now()
-        )
-        .fetch_all(&self.db.pool)
-        .await
-        .map_err(PermissionError::Database)?;
+    // Get all active permissions from database
+    let all_permissions = sqlx::query!(
+        r#"
+        SELECT *
+        FROM permission_grants
+        WHERE NOT revoked
+            AND expires_at > ?
+        ORDER BY username, command
+        "#,
+        Utc::now()
+    )
+    .fetch_all(self.db.get_pool())
+    .await
+    .map_err(PermissionError::Database)?;
 
-        // Group permissions by user for better organization
-        use std::collections::HashMap;
-        let mut user_permissions: HashMap<String, Vec<String>> = HashMap::new();
+    // Group permissions by user for better organization
+    use std::collections::HashMap;
+    let mut user_permissions: HashMap<String, Vec<String>> = HashMap::new();
 
-        for grant in all_permissions {
-            user_permissions
-                .entry(grant.username)
-                .or_default()
-                .push(grant.command);
-        }
-
-        // Build sudoers content
-        for (username, commands) in user_permissions {
-            for command in commands {
-                content.push_str(&format!(
-                    "{} ALL=(ALL) NOPASSWD: {}\n",
-                    username, command
-                ));
-            }
-        }
-
-        // Write to temporary file first
-        let temp_path = self.config.sudoers_path.with_extension("tmp");
-        fs::write(&temp_path, content.as_bytes())
-            .map_err(|e| PermissionError::io_error(e, temp_path.clone()))?;
-
-        // Set correct permissions (0440)
-        Command::new("chmod")
-            .arg("0440")
-            .arg(&temp_path)
-            .status()
-            .map_err(|e| PermissionError::system_command(e, "chmod"))?;
-
-        // Move temporary file to final location
-        fs::rename(&temp_path, &self.config.sudoers_path)
-            .map_err(|e| PermissionError::io_error(e, self.config.sudoers_path.clone()))?;
-
-        Ok(())
+    for row in all_permissions {
+        user_permissions
+            .entry(row.username)
+            .or_default()
+            .push(row.command);
     }
 
+    // Build sudoers content
+    for (username, commands) in user_permissions {
+        for command in commands {
+            content.push_str(&format!(
+                "{} ALL=(ALL) NOPASSWD: {}\n",
+                username, command
+            ));
+        }
+    }
+
+    // Write to temporary file first
+    let temp_path = self.config.sudoers_path.with_extension("tmp");
+    fs::write(&temp_path, content.as_bytes())
+        .map_err(|e| PermissionError::io_error(e, temp_path.clone()))?;
+
+    // Set correct permissions (0440)
+    Command::new("chmod")
+        .arg("0440")
+        .arg(&temp_path)
+        .status()
+        .map_err(|e| PermissionError::system_command(e, "chmod"))?;
+
+    // Move temporary file to final location
+    fs::rename(&temp_path, &self.config.sudoers_path)
+        .map_err(|e| PermissionError::io_error(e, self.config.sudoers_path.clone()))?;
+
+    Ok(())
+}
     /// Check if a user exists on the system
     fn user_exists(&self, username: &str) -> Result<bool> {
         let output = Command::new("id")

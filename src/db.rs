@@ -2,7 +2,7 @@ use std::path::Path;
 use sqlx::{sqlite::{SqlitePool, SqlitePoolOptions}, Row};
 use chrono::{DateTime, Utc};
 use serde::{Serialize, Deserialize};
-use tracing::{info, warn, error};
+use tracing::info;
 
 use crate::error::{Result, PermissionError};
 
@@ -45,6 +45,10 @@ impl Database {
         let db = Self { pool };
         db.initialize().await?;
         Ok(db)
+    }
+
+    pub fn get_pool(&self) -> &SqlitePool {
+        &self.pool
     }
 
     /// Initialize the database schema
@@ -134,119 +138,6 @@ impl Database {
         Ok(id)
     }
 
-    /// Revoke a permission
-    pub async fn revoke_permission(
-        &self,
-        username: &str,
-        command: &str,
-        revoked_by: &str,
-    ) -> Result<bool> {
-        let now = Utc::now();
-        
-        let result = sqlx::query(
-            r#"
-            UPDATE permission_grants
-            SET revoked = TRUE,
-                revoked_at = ?,
-                revoked_by = ?
-            WHERE username = ?
-                AND command = ?
-                AND NOT revoked
-                AND expires_at > ?
-            "#,
-        )
-        .bind(now)
-        .bind(revoked_by)
-        .bind(username)
-        .bind(command)
-        .bind(now)
-        .execute(&self.pool)
-        .await
-        .map_err(PermissionError::Database)?;
-
-        if result.rows_affected() > 0 {
-            self.add_audit_log(
-                username,
-                command,
-                "revoke",
-                Some(&format!("Revoked by {}", revoked_by)),
-            ).await?;
-
-            info!(
-                "Revoked permission: user={}, command={}, revoked_by={}",
-                username, command, revoked_by
-            );
-            Ok(true)
-        } else {
-            Ok(false)
-        }
-    }
-
-    /// Check if a permission is currently valid
-    pub async fn check_permission(
-        &self,
-        username: &str,
-        command: &str,
-    ) -> Result<bool> {
-        let now = Utc::now();
-        
-        let count = sqlx::query(
-            r#"
-            SELECT COUNT(*) as count
-            FROM permission_grants
-            WHERE username = ?
-                AND command = ?
-                AND NOT revoked
-                AND expires_at > ?
-            "#,
-        )
-        .bind(username)
-        .bind(command)
-        .bind(now)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(PermissionError::Database)?
-        .get::<i64, _>("count");
-
-        Ok(count > 0)
-    }
-
-    /// Update last used timestamp for a permission
-    pub async fn update_last_used(
-        &self,
-        username: &str,
-        command: &str,
-    ) -> Result<()> {
-        let now = Utc::now();
-        
-        sqlx::query(
-            r#"
-            UPDATE permission_grants
-            SET last_used = ?
-            WHERE username = ?
-                AND command = ?
-                AND NOT revoked
-                AND expires_at > ?
-            "#,
-        )
-        .bind(now)
-        .bind(username)
-        .bind(command)
-        .bind(now)
-        .execute(&self.pool)
-        .await
-        .map_err(PermissionError::Database)?;
-
-        self.add_audit_log(
-            username,
-            command,
-            "use",
-            None,
-        ).await?;
-
-        Ok(())
-    }
-
     /// List all active permissions for a user
     pub async fn list_user_permissions(
         &self,
@@ -254,11 +145,9 @@ impl Database {
     ) -> Result<Vec<PermissionGrant>> {
         let now = Utc::now();
         
-        let grants = sqlx::query_as!(
-            PermissionGrant,
+        let grants = sqlx::query!(
             r#"
-            SELECT *
-            FROM permission_grants
+            SELECT * FROM permission_grants
             WHERE username = ?
                 AND NOT revoked
                 AND expires_at > ?
@@ -271,8 +160,24 @@ impl Database {
         .await
         .map_err(PermissionError::Database)?;
 
-        Ok(grants)
+        // Convert the raw rows to PermissionGrant structs
+        Ok(grants
+            .into_iter()
+            .map(|row| PermissionGrant {
+                id: row.id,
+                username: row.username,
+                command: row.command,
+                granted_at: row.granted_at,
+                expires_at: row.expires_at,
+                granted_by: row.granted_by,
+                last_used: row.last_used,
+                revoked: row.revoked != 0,
+                revoked_at: row.revoked_at,
+                revoked_by: row.revoked_by,
+            })
+            .collect())
     }
+
 
     /// Add an entry to the audit log
     async fn add_audit_log(

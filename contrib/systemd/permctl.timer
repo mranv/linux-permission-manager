@@ -1,0 +1,11 @@
+[Unit]
+Description=Periodic cleanup of expired permissions
+Documentation=man:permctl(1)
+
+[Timer]
+OnBootSec=15min
+OnUnitActiveSec=15min
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,14 @@
+[Unit]
+Description=Linux Permission Manager Service
+Documentation=man:permctl(1)
+After=network.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/permctl cleanup
+User=root
+Group=root
+
+[Install]
+WantedBy=multi-user.target

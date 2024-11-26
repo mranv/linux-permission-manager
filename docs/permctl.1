@@ -1,0 +1,78 @@
+.TH PERMCTL 1 "November 2024" "Linux Permission Manager" "User Commands"
+.SH NAME
+permctl \- manage temporary elevated permissions in Linux
+.SH SYNOPSIS
+.B permctl
+[\fB\-c\fR \fICONFIG\fR]
+[\fB\-d\fR]
+\fICOMMAND\fR
+[\fIARGS\fR]
+.SH DESCRIPTION
+.B permctl
+is a tool for managing temporary elevated permissions in Linux systems. It provides
+a safe and auditable way to grant and revoke sudo permissions for specific commands.
+.SH OPTIONS
+.TP
+.BR \-c ", " \-\-config =\fIFILE\fR
+Use alternate config file
+.TP
+.BR \-d ", " \-\-debug
+Enable debug logging
+.SH COMMANDS
+.TP
+.B grant \fIUSER\fR \fICOMMAND\fR [\fB\-d\fR \fIDURATION\fR]
+Grant temporary permission to a user
+.TP
+.B revoke \fIUSER\fR \fICOMMAND\fR
+Revoke permission from a user
+.TP
+.B list [\fB\-a\fR] [\fB\-u\fR \fIUSER\fR]
+List permissions
+.TP
+.B commands [\fB\-v\fR]
+Show allowed commands
+.TP
+.B cleanup
+Clean up expired permissions
+.TP
+.B init [\fB\-f\fR]
+Initialize configuration
+.TP
+.B verify
+Verify configuration and permissions
+.SH EXAMPLES
+.TP
+Grant docker access to user for 2 hours:
+.B permctl grant alice /usr/bin/docker -d 120
+.TP
+Revoke permission:
+.B permctl revoke alice /usr/bin/docker
+.TP
+List all active permissions:
+.B permctl list
+.TP
+Show detailed command information:
+.B permctl commands -v
+.SH FILES
+.TP
+.I /etc/permctl/config.yaml
+Default configuration file
+.TP
+.I /etc/sudoers.d/permctl
+Managed sudoers file
+.TP
+.I /var/lib/permctl/permissions.db
+Permission database
+.TP
+.I /var/log/permctl/access.log
+Access log file
+.SH SECURITY
+The program must run as root to modify sudoers files. All operations are logged
+and can be audited. Permissions are automatically cleaned up after expiration.
+.SH AUTHOR
+Your Name <your.email@example.com>
+.SH BUGS
+Report bugs to: https://github.com/yourusername/linux-permission-manager/issues
+.SH SEE ALSO
+.BR sudo (8),
+.BR sudoers (5)

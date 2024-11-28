@@ -37,12 +37,13 @@ declare -r NC='\033[0m'
 #---------------------------
 # Package Management
 #---------------------------
+
 declare -A package_managers=(
-    ["apt"]="apt-get -y"
-    ["dnf"]="dnf -y"
-    ["yum"]="yum -y"
-    ["pacman"]="pacman --noconfirm"
-    ["zypper"]="zypper -n"
+    ["apt"]="apt-get -y install"
+    ["dnf"]="dnf -y install"
+    ["yum"]="yum -y install"
+    ["pacman"]="pacman -S --noconfirm"
+    ["zypper"]="zypper -n install"
 )
 
 declare -A dependencies=(
@@ -112,14 +113,23 @@ install_dependencies() {
             ;;
         pacman)
             pacman -Sy
+            if ! pacman -S --noconfirm base-devel pkg-config sqlite curl; then
+                log "Failed to install dependencies using pacman" "${RED}"
+                exit 1
+            fi
             ;;
         zypper)
             zypper refresh
             ;;
     esac
     
-    # Install dependencies
-    ${package_managers[$pkg_manager]} install ${dependencies[$pkg_manager]}
+    # Install dependencies for non-pacman systems
+    if [[ "$pkg_manager" != "pacman" ]]; then
+        if ! ${package_managers[$pkg_manager]} ${dependencies[$pkg_manager]}; then
+            log "Failed to install dependencies" "${RED}"
+            exit 1
+        fi
+    fi
     
     # Install Rust if not present
     if ! command -v cargo >/dev/null 2>&1; then

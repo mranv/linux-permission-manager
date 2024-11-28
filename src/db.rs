@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::process::Command;
 use sqlx::{sqlite::{SqlitePool, SqlitePoolOptions}, Row};
 use chrono::{DateTime, Utc};
 use serde::{Serialize, Deserialize};
@@ -6,7 +7,6 @@ use tracing::info;
 
 use crate::error::{Result, PermissionError};
 
-/// Represents a permission grant in the database
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PermissionGrant {
     pub id: i64,
@@ -21,29 +21,39 @@ pub struct PermissionGrant {
     pub revoked_by: Option<String>,
 }
 
-/// Database manager for permission storage
 pub struct Database {
     pool: SqlitePool,
 }
 
 impl Database {
-    /// Create a new database connection
     pub async fn new(db_path: impl AsRef<Path>) -> Result<Self> {
-        // Ensure parent directory exists
         if let Some(parent) = db_path.as_ref().parent() {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                PermissionError::io_error(e, parent.to_path_buf())
-            })?;
+            std::fs::create_dir_all(parent)
+                .map_err(|e| PermissionError::io_error(e, parent.to_path_buf()))?;
+            
+            Command::new("chmod")
+                .arg("755")
+                .arg(parent)
+                .status()
+                .map_err(|e| PermissionError::system_command(e, "chmod"))?;
         }
 
+        let connection_string = format!("sqlite:{}", db_path.as_ref().display());
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
-            .connect(&format!("sqlite:{}", db_path.as_ref().display()))
+            .connect(&connection_string)
             .await
             .map_err(PermissionError::Database)?;
 
         let db = Self { pool };
         db.initialize().await?;
+
+        Command::new("chmod")
+            .arg("644")
+            .arg(db_path.as_ref())
+            .status()
+            .map_err(|e| PermissionError::system_command(e, "chmod"))?;
+
         Ok(db)
     }
 
@@ -51,7 +61,6 @@ impl Database {
         &self.pool
     }
 
-    /// Initialize the database schema
     async fn initialize(&self) -> Result<()> {
         sqlx::query(
             r#"
@@ -84,8 +93,7 @@ impl Database {
                 command TEXT NOT NULL,
                 action TEXT NOT NULL,
                 details TEXT
-            );
-            "#,
+            );"#,
         )
         .execute(&self.pool)
         .await
@@ -94,7 +102,6 @@ impl Database {
         Ok(())
     }
 
-    /// Grant a new permission
     pub async fn grant_permission(
         &self,
         username: &str,
@@ -138,7 +145,93 @@ impl Database {
         Ok(id)
     }
 
-    /// List all active permissions for a user
+    pub async fn revoke_permission(
+        &self,
+        username: &str,
+        command: &str,
+        revoked_by: &str,
+    ) -> Result<bool> {
+        let now = Utc::now();
+        
+        let result = sqlx::query(
+            r#"
+            UPDATE permission_grants
+            SET revoked = TRUE,
+                revoked_at = ?,
+                revoked_by = ?
+            WHERE username = ?
+                AND command = ?
+                AND NOT revoked
+                AND expires_at > ?
+            "#,
+        )
+        .bind(now)
+        .bind(revoked_by)
+        .bind(username)
+        .bind(command)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .map_err(PermissionError::Database)?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn check_permission(
+        &self,
+        username: &str,
+        command: &str,
+    ) -> Result<bool> {
+        let now = Utc::now();
+        
+        let result = sqlx::query(
+            r#"
+            SELECT COUNT(*) as count
+            FROM permission_grants
+            WHERE username = ?
+                AND command = ?
+                AND NOT revoked
+                AND expires_at > ?
+            "#,
+        )
+        .bind(username)
+        .bind(command)
+        .bind(now)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(PermissionError::Database)?;
+
+        Ok(result.get::<i64, _>("count") > 0)
+    }
+
+    pub async fn update_last_used(
+        &self,
+        username: &str,
+        command: &str,
+    ) -> Result<()> {
+        let now = Utc::now();
+        
+        sqlx::query(
+            r#"
+            UPDATE permission_grants
+            SET last_used = ?
+            WHERE username = ?
+                AND command = ?
+                AND NOT revoked
+                AND expires_at > ?
+            "#,
+        )
+        .bind(now)
+        .bind(username)
+        .bind(command)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .map_err(PermissionError::Database)?;
+
+        Ok(())
+    }
+
     pub async fn list_user_permissions(
         &self,
         username: &str,
@@ -160,7 +253,6 @@ impl Database {
         .await
         .map_err(PermissionError::Database)?;
 
-        // Convert the raw rows to PermissionGrant structs
         Ok(grants
             .into_iter()
             .map(|row| PermissionGrant {
@@ -178,8 +270,6 @@ impl Database {
             .collect())
     }
 
-
-    /// Add an entry to the audit log
     async fn add_audit_log(
         &self,
         username: &str,
@@ -208,7 +298,6 @@ impl Database {
         Ok(())
     }
 
-    /// Clean up expired permissions
     pub async fn cleanup_expired(&self) -> Result<u64> {
         let now = Utc::now();
         

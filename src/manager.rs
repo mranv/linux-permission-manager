@@ -1,7 +1,7 @@
 use std::process::Command;
 use std::fs;
 use chrono::{Utc, Duration};
-use tracing::info;
+// use tracing::info;
 
 use crate::config::Config;
 use crate::db::{Database, PermissionGrant};

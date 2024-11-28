@@ -1,41 +1,51 @@
 #!/usr/bin/env bash
 
-# Script: install.sh
-# Description: Production-grade installer for Linux Permission Manager
-# Author: Anubhav Gain
+#===================================================================================
+# Linux Permission Manager Installation Script
 # Version: 1.0.0
+# Author: Anubhav Gain
+# Description: Production-grade installer for Linux Permission Manager
+#===================================================================================
 
-# Strict mode configuration
+#---------------------------
+# Environment Configuration
+#---------------------------
 set -euo pipefail
 IFS=$'\n\t'
 
-# Configuration variables
-readonly INSTALL_DIR="/usr/sbin"
-readonly CONFIG_DIR="/etc/permctl"
-readonly DATA_DIR="/var/lib/permctl"
-readonly LOG_DIR="/var/log/permctl"
-readonly SUDOERS_DIR="/etc/sudoers.d"
-readonly SYSTEMD_DIR="/etc/systemd/system"
-readonly MAN_DIR="/usr/share/man/man1"
+#---------------------------
+# Directory Configuration
+#---------------------------
+declare -r INSTALL_DIR="/usr/sbin"
+declare -r CONFIG_DIR="/etc/permctl"
+declare -r DATA_DIR="/var/lib/permctl"
+declare -r LOG_DIR="/var/log/permctl"
+declare -r SUDOERS_DIR="/etc/sudoers.d"
+declare -r SYSTEMD_DIR="/etc/systemd/system"
+declare -r MAN_DIR="/usr/share/man/man1"
 
-# Color definitions
-readonly RED='\033[0;31m'
-readonly GREEN='\033[0;32m'
-readonly YELLOW='\033[1;33m'
-readonly BLUE='\033[0;34m'
-readonly NC='\033[0m'
+#---------------------------
+# Visual Formatting
+#---------------------------
+declare -r RED='\033[0;31m'
+declare -r GREEN='\033[0;32m'
+declare -r YELLOW='\033[1;33m'
+declare -r BLUE='\033[0;34m'
+declare -r BOLD='\033[1m'
+declare -r NC='\033[0m'
 
-# Package management variables
-declare -A PKG_MANAGERS=(
-    ["apt"]="apt-get install -y"
-    ["dnf"]="dnf install -y"
-    ["yum"]="yum install -y"
-    ["pacman"]="pacman -S --noconfirm"
-    ["zypper"]="zypper install -y"
+#---------------------------
+# Package Management
+#---------------------------
+declare -A package_managers=(
+    ["apt"]="apt-get -y"
+    ["dnf"]="dnf -y"
+    ["yum"]="yum -y"
+    ["pacman"]="pacman --noconfirm"
+    ["zypper"]="zypper -n"
 )
 
-# Required dependencies for different distributions
-declare -A DEPENDENCIES=(
+declare -A dependencies=(
     ["apt"]="build-essential pkg-config libsqlite3-dev curl"
     ["dnf"]="gcc pkg-config sqlite-devel curl"
     ["yum"]="gcc pkg-config sqlite-devel curl"
@@ -43,66 +53,62 @@ declare -A DEPENDENCIES=(
     ["zypper"]="gcc pkg-config sqlite3-devel curl"
 )
 
-# Error handling
-trap 'error_handler $? $LINENO $BASH_LINENO "$BASH_COMMAND" $(printf "::%s" ${FUNCNAME[@]:-})' ERR
-
-error_handler() {
-    local exit_code=$1
-    local line_number=$2
-    local bash_lineno=$3
-    local last_command=$4
-    local func_trace=$5
-
-    log "Error occurred in script at line: $line_number" "${RED}"
-    log "Last command executed: $last_command" "${RED}"
-    log "Exit code: $exit_code" "${RED}"
-
-    # Clean up any temporary files or partial installations
-    cleanup
-    exit "$exit_code"
-}
-
-cleanup() {
-    log "Performing cleanup..." "${YELLOW}"
-    # Add cleanup tasks here if needed
-}
-
-# Logging function with timestamps and log file support
+#---------------------------
+# Utility Functions
+#---------------------------
 log() {
-    local message=$1
-    local color=${2:-$NC}
     local timestamp
     timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-    
-    echo -e "${color}${timestamp} - ${message}${NC}" | tee -a "$LOG_DIR/install.log"
+    echo -e "${2:-}${timestamp} - $1${NC}" | tee -a "${LOG_DIR}/install.log"
 }
 
-# Detect package manager
+print_banner() {
+    echo -e "${BLUE}${BOLD}"
+    echo "╔═══════════════════════════════════════════════════════════════╗"
+    echo "║             Linux Permission Manager Installer                 ║"
+    echo "╚═══════════════════════════════════════════════════════════════╝"
+    echo -e "${NC}"
+}
+
+check_root() {
+    if [[ $EUID -ne 0 ]]; then
+        log "This script must be run as root" "${RED}"
+        exit 1
+    fi
+}
+
 detect_package_manager() {
-    for pkg_mgr in "${!PKG_MANAGERS[@]}"; do
-        if command -v "$pkg_mgr" >/dev/null 2>&1; then
-            echo "$pkg_mgr"
+    local pkg_manager
+    for pkg_manager in "${!package_managers[@]}"; do
+        if command -v "$pkg_manager" >/dev/null 2>&1; then
+            echo "$pkg_manager"
             return 0
         fi
     done
-    log "No supported package manager found" "${RED}"
-    exit 1
+    return 1
 }
 
-# Install system dependencies
+#---------------------------
+# Installation Functions
+#---------------------------
 install_dependencies() {
-    local pkg_mgr
-    pkg_mgr=$(detect_package_manager)
+    local pkg_manager
+    pkg_manager=$(detect_package_manager)
     
-    log "Installing system dependencies using $pkg_mgr..." "${BLUE}"
+    if [[ -z "$pkg_manager" ]]; then
+        log "No supported package manager found" "${RED}"
+        exit 1
+    fi
     
-    # Update package manager cache
-    case $pkg_mgr in
+    log "Using package manager: $pkg_manager" "${BLUE}"
+    
+    # Update package cache
+    case $pkg_manager in
         apt)
             apt-get update
             ;;
         dnf|yum)
-            $pkg_mgr makecache
+            $pkg_manager makecache
             ;;
         pacman)
             pacman -Sy
@@ -111,109 +117,117 @@ install_dependencies() {
             zypper refresh
             ;;
     esac
-
+    
     # Install dependencies
-    ${PKG_MANAGERS[$pkg_mgr]} ${DEPENDENCIES[$pkg_mgr]}
-
+    ${package_managers[$pkg_manager]} install ${dependencies[$pkg_manager]}
+    
     # Install Rust if not present
     if ! command -v cargo >/dev/null 2>&1; then
-        log "Installing Rust..." "${BLUE}"
+        log "Installing Rust..." "${YELLOW}"
         curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+        # shellcheck source=/dev/null
         source "$HOME/.cargo/env"
     fi
 }
 
-# Directory management with proper permissions
-create_directory() {
-    local dir=$1
-    local perms=${2:-755}
-    local owner=${3:-root:root}
+create_directories() {
+    local -a dirs=("$CONFIG_DIR" "$DATA_DIR" "$LOG_DIR" "$SUDOERS_DIR")
+    local dir
     
-    if [[ ! -d "$dir" ]]; then
-        mkdir -p "$dir"
-        log "Created directory: $dir" "${YELLOW}"
-    fi
-    
-    chown "$owner" "$dir"
-    chmod "$perms" "$dir"
+    for dir in "${dirs[@]}"; do
+        if [[ ! -d "$dir" ]]; then
+            mkdir -p "$dir"
+            chown root:root "$dir"
+            chmod 755 "$dir"
+            log "Created directory: $dir" "${YELLOW}"
+        fi
+    done
 }
 
-# Main installation process
-main() {
-    # Check for root privileges
-    if [[ $EUID -ne 0 ]]; then
-        log "This script must be run as root" "${RED}"
-        exit 1
-    }
-
-    # Create log directory first for logging
-    create_directory "$LOG_DIR" "755" "root:root"
-    
-    log "Starting Linux Permission Manager installation..." "${BLUE}"
-    
-    # Install dependencies
-    install_dependencies
-
-    # Create required directories
-    create_directory "$CONFIG_DIR" "755"
-    create_directory "$DATA_DIR" "750"
-    create_directory "$SUDOERS_DIR" "750"
-
-    # Build and install
+build_and_install() {
     log "Building application..." "${BLUE}"
     if ! cargo build --release; then
         log "Build failed" "${RED}"
         exit 1
     fi
-
-    # Install binary
+    
     install -m 755 target/release/permctl "$INSTALL_DIR/permctl"
+    log "Binary installed successfully" "${GREEN}"
+}
 
+configure_system() {
     # Initialize configuration
     if [[ ! -f "$CONFIG_DIR/config.yaml" ]]; then
         "$INSTALL_DIR/permctl" init --force
         chmod 600 "$CONFIG_DIR/config.yaml"
+        log "Configuration initialized" "${GREEN}"
     fi
-
-    # Install systemd units
-    for unit in permctl.service permctl.timer; do
-        if [[ -f "contrib/systemd/$unit" ]]; then
-            install -m 644 "contrib/systemd/$unit" "$SYSTEMD_DIR/$unit"
-        fi
-    done
-
-    # Configure system
-    systemctl daemon-reload
-    systemctl enable --now permctl.timer
-
+    
+    # Setup systemd
+    if [[ -d "contrib/systemd" ]]; then
+        for unit in permctl.service permctl.timer; do
+            if [[ -f "contrib/systemd/$unit" ]]; then
+                install -m 644 "contrib/systemd/$unit" "$SYSTEMD_DIR/$unit"
+            fi
+        done
+        systemctl daemon-reload
+        systemctl enable --now permctl.timer
+        log "Systemd services configured" "${GREEN}"
+    fi
+    
     # Setup sudoers
     echo "# Managed by permctl - DO NOT EDIT" > "$SUDOERS_DIR/permctl"
     chmod 440 "$SUDOERS_DIR/permctl"
+    log "Sudoers configuration complete" "${GREEN}"
+}
 
-    # Verify installation
+verify_installation() {
     if "$INSTALL_DIR/permctl" verify; then
-        log "Installation completed successfully!" "${GREEN}"
-        print_next_steps
+        log "Installation verified successfully" "${GREEN}"
+        return 0
     else
         log "Installation verification failed" "${RED}"
+        return 1
+    fi
+}
+
+print_completion() {
+    echo
+    echo -e "${GREEN}${BOLD}Installation completed successfully!${NC}"
+    echo
+    echo "Next steps:"
+    echo "1. Edit your configuration: $CONFIG_DIR/config.yaml"
+    echo "2. Review permissions: sudo permctl verify"
+    echo "3. Grant your first permission: sudo permctl grant"
+    echo
+    echo "For more information, visit: https://github.com/mranv/linux-permission-manager"
+    echo
+}
+
+#---------------------------
+# Main Installation Process
+#---------------------------
+main() {
+    print_banner
+    check_root
+    
+    # Create log directory first
+    mkdir -p "$LOG_DIR"
+    
+    log "Starting installation..." "${BLUE}"
+    
+    create_directories
+    install_dependencies
+    build_and_install
+    configure_system
+    
+    if verify_installation; then
+        print_completion
+    else
+        log "Installation failed" "${RED}"
         exit 1
     fi
 }
 
-print_next_steps() {
-    cat << EOF
-
-${GREEN}Installation completed successfully!${NC}
-
-Next steps:
-1. Configure your allowed commands in $CONFIG_DIR/config.yaml
-2. Run 'permctl --help' to see available commands
-3. Check logs in $LOG_DIR for any issues
-4. Visit https://github.com/yourusername/linux-permission-manager for documentation
-
-For support, please file an issue on the GitHub repository.
-EOF
-}
-
-# Execute main installation process
+# Execute main installation
 main "$@"

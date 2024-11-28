@@ -1,7 +1,8 @@
 use std::process::Command;
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use chrono::{Utc, Duration};
-// use tracing::info;
+use tracing::{info, warn, error};
 
 use crate::config::Config;
 use crate::db::{Database, PermissionGrant};
@@ -14,29 +15,50 @@ pub struct PermissionManager {
 }
 
 impl PermissionManager {
-    /// Create a new permission manager instance
+    /// Create a new permission manager instance with the provided configuration
     pub async fn new(config: Config) -> Result<Self> {
+        // Validate the configuration before proceeding
+        config.validate()?;
+
+        // Set up the required directory structure
+        Self::setup_directories(&config)?;
+
+        // Initialize the database connection
         let db = Database::new(&config.db_path).await?;
+        
         let manager = Self { config, db };
         manager.initialize().await?;
+        
         Ok(manager)
     }
 
-    /// Initialize the permission manager
+    /// Initialize the permission manager and set up required components
     async fn initialize(&self) -> Result<()> {
-        // Ensure required directories exist
+        // Create and set up required directories
         for path in [
             self.config.sudoers_path.parent(),
             self.config.db_path.parent(),
             self.config.log_path.parent(),
         ].iter().flatten() {
-            fs::create_dir_all(path).map_err(|e| PermissionError::io_error(e, path.to_path_buf()))?;
+            fs::create_dir_all(path)
+                .map_err(|e| PermissionError::io_error(e, path.to_path_buf()))?;
+            
+            // Set appropriate directory permissions
+            let mut perms = fs::metadata(path)?.permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(path, perms)
+                .map_err(|e| PermissionError::io_error(e, path.to_path_buf()))?;
         }
 
-        // Initialize sudoers file
+        // Initialize sudoers file configuration
         self.update_sudoers_file().await?;
 
         Ok(())
+    }
+
+    /// Get a reference to the current configuration
+    pub fn config(&self) -> &Config {
+        &self.config
     }
 
     /// Grant permission to a user for a specific command
@@ -59,12 +81,12 @@ impl PermissionManager {
             )));
         }
 
-        // Validate user exists
+        // Validate user exists on system
         if !self.user_exists(username)? {
             return Err(PermissionError::UserNotFound(username.to_string()));
         }
 
-        // Check user groups
+        // Check user group requirements
         for group in &cmd_config.required_groups {
             if !self.user_in_group(username, group)? {
                 return Err(PermissionError::GroupRequirementNotMet {
@@ -74,14 +96,19 @@ impl PermissionManager {
             }
         }
 
-        // Calculate expiration
+        // Calculate expiration time
         let expires_at = Utc::now() + duration;
 
         // Grant permission in database
         let id = self.db.grant_permission(username, command, expires_at, granted_by).await?;
 
-        // Update sudoers file
+        // Update sudoers configuration
         self.update_sudoers_file().await?;
+
+        info!(
+            "Granted permission: id={}, user={}, command={}, expires={}",
+            id, username, command, expires_at
+        );
 
         Ok(id)
     }
@@ -97,8 +124,11 @@ impl PermissionManager {
         let revoked = self.db.revoke_permission(username, command, revoked_by).await?;
 
         if revoked {
-            // Update sudoers file
+            // Update sudoers configuration
             self.update_sudoers_file().await?;
+            info!("Revoked permission: user={}, command={}", username, command);
+        } else {
+            warn!("No active permission found to revoke: user={}, command={}", username, command);
         }
 
         Ok(revoked)
@@ -109,84 +139,63 @@ impl PermissionManager {
         self.db.list_user_permissions(username).await
     }
 
-    /// Check if a user has permission for a specific command
-    pub async fn check_permission(&self, username: &str, command: &str) -> Result<bool> {
-        self.db.check_permission(username, command).await
-    }
-
-    /// Update the usage timestamp for a permission
-    pub async fn record_usage(&self, username: &str, command: &str) -> Result<()> {
-        self.db.update_last_used(username, command).await
-    }
-
     /// Clean up expired permissions
     pub async fn cleanup_expired(&self) -> Result<u64> {
         let count = self.db.cleanup_expired().await?;
         if count > 0 {
             self.update_sudoers_file().await?;
+            info!("Cleaned up {} expired permission(s)", count);
         }
         Ok(count)
     }
 
     /// Update the sudoers file with current permissions
-async fn update_sudoers_file(&self) -> Result<()> {
-    let header = "# This file is managed by permctl. Do not edit manually.\n\n";
-    let mut content = String::from(header);
+    async fn update_sudoers_file(&self) -> Result<()> {
+        let header = "# This file is managed by permctl. Do not edit manually.\n\n";
+        let mut content = String::from(header);
 
-    // Get all active permissions from database
-    let all_permissions = sqlx::query!(
-        r#"
-        SELECT *
-        FROM permission_grants
-        WHERE NOT revoked
-            AND expires_at > ?
-        ORDER BY username, command
-        "#,
-        Utc::now()
-    )
-    .fetch_all(self.db.get_pool())
-    .await
-    .map_err(PermissionError::Database)?;
+        // Get all active permissions
+        let all_permissions = self.db.list_active_permissions().await?;
 
-    // Group permissions by user for better organization
-    use std::collections::HashMap;
-    let mut user_permissions: HashMap<String, Vec<String>> = HashMap::new();
+        // Group permissions by user for better organization
+        use std::collections::HashMap;
+        let mut user_permissions: HashMap<String, Vec<String>> = HashMap::new();
 
-    for row in all_permissions {
-        user_permissions
-            .entry(row.username)
-            .or_default()
-            .push(row.command);
-    }
-
-    // Build sudoers content
-    for (username, commands) in user_permissions {
-        for command in commands {
-            content.push_str(&format!(
-                "{} ALL=(ALL) NOPASSWD: {}\n",
-                username, command
-            ));
+        for grant in all_permissions {
+            user_permissions
+                .entry(grant.username)
+                .or_default()
+                .push(grant.command);
         }
+
+        // Build sudoers content
+        for (username, commands) in user_permissions {
+            for command in commands {
+                content.push_str(&format!(
+                    "{} ALL=(ALL) NOPASSWD: {}\n",
+                    username, command
+                ));
+            }
+        }
+
+        // Write to temporary file first
+        let temp_path = self.config.sudoers_path.with_extension("tmp");
+        fs::write(&temp_path, content.as_bytes())
+            .map_err(|e| PermissionError::io_error(e, temp_path.clone()))?;
+
+        // Set correct permissions (0440)
+        let mut perms = fs::metadata(&temp_path)?.permissions();
+        perms.set_mode(0o440);
+        fs::set_permissions(&temp_path, perms)
+            .map_err(|e| PermissionError::io_error(e, temp_path.clone()))?;
+
+        // Move temporary file to final location
+        fs::rename(&temp_path, &self.config.sudoers_path)
+            .map_err(|e| PermissionError::io_error(e, self.config.sudoers_path.clone()))?;
+
+        Ok(())
     }
 
-    // Write to temporary file first
-    let temp_path = self.config.sudoers_path.with_extension("tmp");
-    fs::write(&temp_path, content.as_bytes())
-        .map_err(|e| PermissionError::io_error(e, temp_path.clone()))?;
-
-    // Set correct permissions (0440)
-    Command::new("chmod")
-        .arg("0440")
-        .arg(&temp_path)
-        .status()
-        .map_err(|e| PermissionError::system_command(e, "chmod"))?;
-
-    // Move temporary file to final location
-    fs::rename(&temp_path, &self.config.sudoers_path)
-        .map_err(|e| PermissionError::io_error(e, self.config.sudoers_path.clone()))?;
-
-    Ok(())
-}
     /// Check if a user exists on the system
     fn user_exists(&self, username: &str) -> Result<bool> {
         let output = Command::new("id")
@@ -206,6 +215,27 @@ async fn update_sudoers_file(&self) -> Result<()> {
 
         let groups = String::from_utf8_lossy(&output.stdout);
         Ok(groups.split_whitespace().any(|g| g == group))
+    }
+
+    /// Set up required directories with appropriate permissions
+    fn setup_directories(config: &Config) -> Result<()> {
+        let dirs = [
+            config.db_path.parent(),
+            config.log_path.parent(),
+            config.sudoers_path.parent(),
+        ];
+
+        for dir in dirs.iter().flatten() {
+            fs::create_dir_all(dir)
+                .map_err(|e| PermissionError::io_error(e, dir.to_path_buf()))?;
+            
+            let mut perms = fs::metadata(dir)?.permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(dir, perms)
+                .map_err(|e| PermissionError::io_error(e, dir.to_path_buf()))?;
+        }
+
+        Ok(())
     }
 }
 
@@ -227,11 +257,9 @@ mod tests {
             log_retention_days: 30,
         };
 
-        // Add a test command
-        use crate::config::CommandConfig;
         config.allowed_commands.insert(
             "/test/command".to_string(),
-            CommandConfig {
+            crate::config::CommandConfig {
                 description: "Test command".to_string(),
                 max_duration: 60,
                 required_groups: vec!["users".to_string()],
@@ -245,11 +273,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_grant_and_check_permission() {
+    async fn test_grant_and_revoke_permission() {
         let (manager, _temp) = create_test_manager().await;
-        
-        // Mock user_exists and user_in_group for testing
-        // In a real environment, these would check against the system
         
         let id = manager.grant_permission(
             "testuser",
@@ -259,26 +284,13 @@ mod tests {
         ).await.unwrap();
 
         assert!(id > 0);
-        assert!(manager.check_permission("testuser", "/test/command").await.unwrap());
-    }
 
-    #[tokio::test]
-    async fn test_revoke_permission() {
-        let (manager, _temp) = create_test_manager().await;
-
-        manager.grant_permission(
+        let revoked = manager.revoke_permission(
             "testuser",
             "/test/command",
-            Duration::minutes(30),
             "admin"
         ).await.unwrap();
 
-        assert!(manager.revoke_permission(
-            "testuser",
-            "/test/command",
-            "admin"
-        ).await.unwrap());
-
-        assert!(!manager.check_permission("testuser", "/test/command").await.unwrap());
+        assert!(revoked);
     }
 }

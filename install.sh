@@ -140,6 +140,23 @@ install_dependencies() {
     fi
 }
 
+setup_database_directory() {
+    log "Setting up database directory..." "${BLUE}"
+    
+    # Create database directory
+    mkdir -p "$DATA_DIR"
+    chmod 777 "$DATA_DIR"
+    
+    # Initialize empty database if needed
+    DB_FILE="$DATA_DIR/permissions.db"
+    if [[ ! -f "$DB_FILE" ]]; then
+        touch "$DB_FILE"
+        chmod 666 "$DB_FILE"
+    fi
+    
+    log "Database directory setup complete" "${GREEN}"
+}
+
 create_directories() {
     local -a dirs=("$CONFIG_DIR" "$DATA_DIR" "$LOG_DIR" "$SUDOERS_DIR")
     local dir
@@ -230,6 +247,7 @@ main() {
     install_dependencies
     build_and_install
     configure_system
+    setup_database_directory
     
     if verify_installation; then
         print_completion

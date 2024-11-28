@@ -1,12 +1,14 @@
 use std::path::Path;
-use std::process::Command;
 use sqlx::{sqlite::{SqlitePool, SqlitePoolOptions}, Row};
 use chrono::{DateTime, Utc};
 use serde::{Serialize, Deserialize};
-use tracing::info;
+use tracing::{info, warn, error};
+use std::os::unix::fs::PermissionsExt;
+use std::fs;
 
 use crate::error::{Result, PermissionError};
 
+/// Represents a permission grant in the database
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PermissionGrant {
     pub id: i64,
@@ -21,26 +23,49 @@ pub struct PermissionGrant {
     pub revoked_by: Option<String>,
 }
 
+/// Database manager for permission storage
 pub struct Database {
     pool: SqlitePool,
 }
 
 impl Database {
+    /// Create a new database connection with proper initialization
     pub async fn new(db_path: impl AsRef<Path>) -> Result<Self> {
+        // Ensure the parent directory exists with proper permissions
         if let Some(parent) = db_path.as_ref().parent() {
-            std::fs::create_dir_all(parent)
+            fs::create_dir_all(parent)
                 .map_err(|e| PermissionError::io_error(e, parent.to_path_buf()))?;
             
-            Command::new("chmod")
-                .arg("755")
-                .arg(parent)
-                .status()
-                .map_err(|e| PermissionError::system_command(e, "chmod"))?;
+            let mut perms = fs::metadata(parent)?.permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(parent, perms)
+                .map_err(|e| PermissionError::io_error(e, parent.to_path_buf()))?;
         }
 
-        let connection_string = format!("sqlite:{}", db_path.as_ref().display());
+        // Create a robust connection string with proper settings
+        let connection_string = format!(
+            "sqlite:{}?mode=rwc&cache=shared&timeout=60",
+            db_path.as_ref().display()
+        );
+
+        // Configure connection pool with appropriate settings
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
+            .min_connections(1)
+            .acquire_timeout(std::time::Duration::from_secs(30))
+            .after_connect(|conn, _| Box::pin(async move {
+                // Enable WAL mode for better concurrency
+                sqlx::query("PRAGMA journal_mode=WAL")
+                    .execute(conn)
+                    .await?;
+                
+                // Set busy timeout for concurrent access
+                sqlx::query("PRAGMA busy_timeout=10000")
+                    .execute(conn)
+                    .await?;
+                
+                Ok(())
+            }))
             .connect(&connection_string)
             .await
             .map_err(PermissionError::Database)?;
@@ -48,22 +73,27 @@ impl Database {
         let db = Self { pool };
         db.initialize().await?;
 
-        Command::new("chmod")
-            .arg("644")
-            .arg(db_path.as_ref())
-            .status()
-            .map_err(|e| PermissionError::system_command(e, "chmod"))?;
+        // Set appropriate permissions on the database file
+        if db_path.as_ref().exists() {
+            let mut perms = fs::metadata(db_path.as_ref())?.permissions();
+            perms.set_mode(0o644);
+            fs::set_permissions(db_path.as_ref(), perms)
+                .map_err(|e| PermissionError::io_error(e, db_path.as_ref().to_path_buf()))?;
+        }
 
         Ok(db)
     }
 
+    /// Get a reference to the connection pool
     pub fn get_pool(&self) -> &SqlitePool {
         &self.pool
     }
 
+    /// Initialize the database schema with proper indices
     async fn initialize(&self) -> Result<()> {
         sqlx::query(
             r#"
+            -- Permission grants table
             CREATE TABLE IF NOT EXISTS permission_grants (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 username TEXT NOT NULL,
@@ -78,6 +108,7 @@ impl Database {
                 UNIQUE(username, command) ON CONFLICT REPLACE
             );
 
+            -- Indices for efficient querying
             CREATE INDEX IF NOT EXISTS idx_permissions_user 
                 ON permission_grants(username);
             CREATE INDEX IF NOT EXISTS idx_permissions_expires 
@@ -86,6 +117,7 @@ impl Database {
                 ON permission_grants(username, command, expires_at) 
                 WHERE NOT revoked;
 
+            -- Audit log table
             CREATE TABLE IF NOT EXISTS audit_log (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 timestamp DATETIME NOT NULL,
@@ -93,7 +125,12 @@ impl Database {
                 command TEXT NOT NULL,
                 action TEXT NOT NULL,
                 details TEXT
-            );"#,
+            );
+
+            -- Index for audit log queries
+            CREATE INDEX IF NOT EXISTS idx_audit_log_timestamp 
+                ON audit_log(timestamp);
+            "#,
         )
         .execute(&self.pool)
         .await
@@ -102,6 +139,7 @@ impl Database {
         Ok(())
     }
 
+    /// Grant a new permission with proper logging
     pub async fn grant_permission(
         &self,
         username: &str,
@@ -130,6 +168,7 @@ impl Database {
 
         let id = result.get::<i64, _>("id");
 
+        // Log the grant in audit log
         self.add_audit_log(
             username,
             command,
@@ -145,6 +184,7 @@ impl Database {
         Ok(id)
     }
 
+    /// Revoke an existing permission
     pub async fn revoke_permission(
         &self,
         username: &str,
@@ -174,9 +214,21 @@ impl Database {
         .await
         .map_err(PermissionError::Database)?;
 
-        Ok(result.rows_affected() > 0)
+        let revoked = result.rows_affected() > 0;
+
+        if revoked {
+            self.add_audit_log(
+                username,
+                command,
+                "revoke",
+                Some(&format!("Revoked by {}", revoked_by)),
+            ).await?;
+        }
+
+        Ok(revoked)
     }
 
+    /// Check if a permission is currently valid
     pub async fn check_permission(
         &self,
         username: &str,
@@ -204,6 +256,7 @@ impl Database {
         Ok(result.get::<i64, _>("count") > 0)
     }
 
+    /// Update the last used timestamp for a permission
     pub async fn update_last_used(
         &self,
         username: &str,
@@ -232,6 +285,7 @@ impl Database {
         Ok(())
     }
 
+    /// List all active permissions for a user
     pub async fn list_user_permissions(
         &self,
         username: &str,
@@ -270,6 +324,41 @@ impl Database {
             .collect())
     }
 
+    /// List all active permissions across all users
+    pub async fn list_active_permissions(&self) -> Result<Vec<PermissionGrant>> {
+        let now = Utc::now();
+        
+        let grants = sqlx::query!(
+            r#"
+            SELECT * FROM permission_grants
+            WHERE NOT revoked
+                AND expires_at > ?
+            ORDER BY username, command
+            "#,
+            now
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(PermissionError::Database)?;
+
+        Ok(grants
+            .into_iter()
+            .map(|row| PermissionGrant {
+                id: row.id,
+                username: row.username,
+                command: row.command,
+                granted_at: row.granted_at,
+                expires_at: row.expires_at,
+                granted_by: row.granted_by,
+                last_used: row.last_used,
+                revoked: row.revoked != 0,
+                revoked_at: row.revoked_at,
+                revoked_by: row.revoked_by,
+            })
+            .collect())
+    }
+
+    /// Add an entry to the audit log
     async fn add_audit_log(
         &self,
         username: &str,
@@ -298,6 +387,7 @@ impl Database {
         Ok(())
     }
 
+    /// Clean up expired permissions
     pub async fn cleanup_expired(&self) -> Result<u64> {
         let now = Utc::now();
         
@@ -317,7 +407,12 @@ impl Database {
         .await
         .map_err(PermissionError::Database)?;
 
-        Ok(result.rows_affected())
+        let count = result.rows_affected();
+        if count > 0 {
+            info!("Cleaned up {} expired permission(s)", count);
+        }
+
+        Ok(count)
     }
 }
 
